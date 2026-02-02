@@ -1,0 +1,12 @@
+name = "treechat"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[vars]
+# Non-secret config goes here
+
+# Secrets (set via `wrangler secret put`):
+# - DISCORD_PUBLIC_KEY
+# - DISCORD_TOKEN
+# - DISCORD_APP_ID
+# - ANTHROPIC_API_KEY
