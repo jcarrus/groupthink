@@ -1,4 +1,4 @@
-name = "treechat"
+name = "groupthink"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
@@ -10,3 +10,9 @@ compatibility_date = "2024-01-01"
 # - DISCORD_TOKEN
 # - DISCORD_APP_ID
 # - ANTHROPIC_API_KEY
+
+# Workflow for durable LLM processing (no timeout!)
+[[workflows]]
+name = "groupthink-workflow"
+binding = "GROUPTHINK_WORKFLOW"
+class_name = "GroupThinkWorkflow"

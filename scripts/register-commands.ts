@@ -25,20 +25,24 @@ function getCommands(isDev: boolean) {
   const suffix = isDev ? '-dev' : '';
   return [
     {
-      name: `chat${suffix}`,
-      description: 'Chat with Claude. In a thread: continues conversation. In channel: starts new thread.',
-      options: [
-        {
-          name: 'message',
-          description: 'Your message (optional in threads, required to start new conversation)',
-          type: 3, // STRING
-          required: false,
-        },
-      ],
+      name: `generate${suffix}`,
+      description: 'Generate a response from Claude using channel/thread context.',
     },
     {
-      name: `Branch from here${suffix}`,
-      type: 3, // MESSAGE command (right-click menu)
+      name: `summarize${suffix}`,
+      description: 'Create a summary checkpoint. Future /generate calls only use messages after this.',
+    },
+    {
+      name: `post-to-channel${suffix}`,
+      description: 'Post critical insights from this thread to the parent channel.',
+    },
+    {
+      name: `branch${suffix}`,
+      description: 'Copy the full conversation to a new channel/thread.',
+    },
+    {
+      name: `branch-with-summary${suffix}`,
+      description: 'Create a new channel/thread with a summarized context.',
     },
   ];
 }

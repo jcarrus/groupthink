@@ -1,22 +1,27 @@
 /**
  * Discord LLM Bot - Cloudflare Worker
  * Handles Discord interactions via webhook, creates threads for Claude conversations.
+ * Uses Cloudflare Workflows for durable async processing of LLM requests (no timeout!).
  */
 import nacl from 'tweetnacl';
 import { InteractionType, InteractionResponseType } from 'discord-interactions';
-import { handleChatCommand, handleThreadMessage } from './commands';
-import { handleBranchCommand } from './branch';
+import { handleGenerateCommand, handleSummarizeCommand, handlePostToChannelCommand, handleBranchCommand, handleBranchWithSummaryCommand } from './commands';
+import { GroupThinkWorkflow, type WorkflowParams } from './workflow';
+
+// Re-export the workflow class so Cloudflare can find it
+export { GroupThinkWorkflow };
 
 export interface Env {
   DISCORD_PUBLIC_KEY: string;
   DISCORD_TOKEN: string;
   DISCORD_APP_ID: string;
   ANTHROPIC_API_KEY: string;
+  GROUPTHINK_WORKFLOW: Workflow<WorkflowParams>;
 }
 
 /** Discord interaction payload (simplified, we only type what we use) */
 interface Interaction {
-  type: InteractionType;
+  type: InteractionType | number;
   data?: {
     name?: string;
     options?: Array<{ name: string; value: string }>;
@@ -92,14 +97,23 @@ export default {
       });
     }
 
-    // Slash commands and message commands (support both prod and dev names)
+    // Slash commands (support both prod and dev names)
     if (interaction.type === InteractionType.APPLICATION_COMMAND) {
       const commandName = interaction.data?.name;
-      if (commandName === 'chat' || commandName === 'chat-dev') {
-        return handleChatCommand(interaction, env, ctx);
+      if (commandName === 'generate' || commandName === 'generate-dev') {
+        return handleGenerateCommand(interaction, env);
       }
-      if (commandName === 'Branch from here' || commandName === 'Branch from here-dev') {
-        return handleBranchCommand(interaction, env, ctx);
+      if (commandName === 'summarize' || commandName === 'summarize-dev') {
+        return handleSummarizeCommand(interaction, env);
+      }
+      if (commandName === 'post-to-channel' || commandName === 'post-to-channel-dev') {
+        return handlePostToChannelCommand(interaction, env);
+      }
+      if (commandName === 'branch' || commandName === 'branch-dev') {
+        return handleBranchCommand(interaction, env);
+      }
+      if (commandName === 'branch-with-summary' || commandName === 'branch-with-summary-dev') {
+        return handleBranchWithSummaryCommand(interaction, env);
       }
     }
 
