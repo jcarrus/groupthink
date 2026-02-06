@@ -66,17 +66,46 @@ const MAX_MESSAGE_LENGTH = 2000;
 const SUMMARY_MARKER = '--- Summary so far ---';
 const MAX_CONTEXT_TOKENS = 200000;
 
+// Claude Sonnet 4.5 pricing (per million tokens)
+const INPUT_PRICE_PER_M = 3.00;
+const OUTPUT_PRICE_PER_M = 15.00;
+const CACHE_READ_PRICE_PER_M = 0.30;
+const CACHE_WRITE_PRICE_PER_M = 3.75;
+
 // ============================================================================
 // Utility Functions
 // ============================================================================
 
-const formatContextRemaining = (usage: Record<string, unknown>): string => {
-  const input = (usage.input_tokens as number) || 0;
-  const output = (usage.output_tokens as number) || 0;
-  const used = input + output;
-  const remaining = MAX_CONTEXT_TOKENS - used;
-  const percentUsed = ((used / MAX_CONTEXT_TOKENS) * 100).toFixed(1);
-  return `-# (${remaining.toLocaleString()} tokens remaining · ${percentUsed}% used)`;
+const formatUsageInfo = (usage: Record<string, unknown>): string => {
+  const inputTokens = (usage.input_tokens as number) || 0;
+  const outputTokens = (usage.output_tokens as number) || 0;
+  const cacheCreationTokens = (usage.cache_creation_input_tokens as number) || 0;
+  const cacheReadTokens = (usage.cache_read_input_tokens as number) || 0;
+  
+  // Calculate costs
+  const inputCost = (inputTokens / 1_000_000) * INPUT_PRICE_PER_M;
+  const outputCost = (outputTokens / 1_000_000) * OUTPUT_PRICE_PER_M;
+  const cacheReadCost = (cacheReadTokens / 1_000_000) * CACHE_READ_PRICE_PER_M;
+  const cacheWriteCost = (cacheCreationTokens / 1_000_000) * CACHE_WRITE_PRICE_PER_M;
+  const totalCost = inputCost + outputCost + cacheReadCost + cacheWriteCost;
+  
+  // Context remaining
+  const totalUsed = inputTokens + outputTokens;
+  const remaining = MAX_CONTEXT_TOKENS - totalUsed;
+  const percentUsed = ((totalUsed / MAX_CONTEXT_TOKENS) * 100).toFixed(1);
+  
+  // Build info string
+  const parts: string[] = [];
+  parts.push(`${remaining.toLocaleString()} tokens remaining (${percentUsed}% used)`);
+  parts.push(`in: ${inputTokens.toLocaleString()}, out: ${outputTokens.toLocaleString()}`);
+  
+  if (cacheReadTokens > 0 || cacheCreationTokens > 0) {
+    parts.push(`cache: ${cacheReadTokens.toLocaleString()} read, ${cacheCreationTokens.toLocaleString()} write`);
+  }
+  
+  parts.push(`$${totalCost.toFixed(4)}`);
+  
+  return `-# (${parts.join(' · ')})`;
 };
 
 const isSummaryMarker = (msg: DiscordMessage): boolean =>
@@ -453,7 +482,7 @@ export class GroupThinkWorkflow extends WorkflowEntrypoint<WorkflowEnv, Workflow
         userMap: Record<string, string> 
       };
       const userMapRestored = new Map(Object.entries(userMapObj));
-      const tokenInfo = formatContextRemaining(usage);
+      const tokenInfo = formatUsageInfo(usage);
       
       // Parse response for artifacts and message breaks
       const { messages: msgParts, artifacts } = parseResponse(text);
@@ -514,7 +543,7 @@ export class GroupThinkWorkflow extends WorkflowEntrypoint<WorkflowEnv, Workflow
     await step.do('post-response', async () => {
       const { text, usage } = JSON.parse(responseJson) as { text: string; usage: Record<string, number> };
       const summaryMessage = `${SUMMARY_MARKER}\n${text}`;
-      const tokenInfo = formatContextRemaining(usage);
+      const tokenInfo = formatUsageInfo(usage);
       
       // Split if too long
       const parts = splitLongMessage(summaryMessage);
@@ -583,7 +612,7 @@ export class GroupThinkWorkflow extends WorkflowEntrypoint<WorkflowEnv, Workflow
       const { text, usage } = JSON.parse(responseJson) as { text: string; usage: Record<string, number> };
       const threadName = threadInfo.name || 'thread';
       const documentMessage = `📋 **Insights from "${threadName}"**\n\n${text}`;
-      const tokenInfo = formatContextRemaining(usage);
+      const tokenInfo = formatUsageInfo(usage);
       
       // Split if too long
       const parts = splitLongMessage(documentMessage);
@@ -643,7 +672,7 @@ export class GroupThinkWorkflow extends WorkflowEntrypoint<WorkflowEnv, Workflow
     // Step 4: Create new channel/thread with summary
     await step.do('create-branch', async () => {
       const { text, usage } = JSON.parse(responseJson) as { text: string; usage: Record<string, number> };
-      const tokenInfo = formatContextRemaining(usage);
+      const tokenInfo = formatUsageInfo(usage);
       const summaryMessage = `${SUMMARY_MARKER}\n${text}`;
       
       if (params.isThread) {

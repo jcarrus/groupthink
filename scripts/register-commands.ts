@@ -51,8 +51,13 @@ async function registerCommands() {
   loadDevVars();
   const appId = process.env.DISCORD_APP_ID;
   const token = process.env.DISCORD_TOKEN;
-  const guildId = process.env.DISCORD_GUILD_ID;
+  const guildIdFromEnv = process.env.DISCORD_GUILD_ID;
   const clearGlobal = process.argv.includes('--clear-global');
+  const isProd = process.argv.includes('--prod');
+  
+  // Allow passing guild ID as argument: --guild=123456789
+  const guildArg = process.argv.find(arg => arg.startsWith('--guild='));
+  const guildId = guildArg ? guildArg.split('=')[1] : guildIdFromEnv;
 
   if (!appId || !token) {
     console.error('Missing DISCORD_APP_ID or DISCORD_TOKEN in .dev.vars or env');
@@ -82,10 +87,12 @@ async function registerCommands() {
     ? `${DISCORD_API}/applications/${appId}/guilds/${guildId}/commands`
     : `${DISCORD_API}/applications/${appId}/commands`;
 
-  const isDev = !!guildId;
+  // Use -dev suffix only if guild is set AND --prod flag is NOT used
+  const isDev = !!guildId && !isProd;
   const commands = getCommands(isDev);
   
-  console.log(`Registering commands ${guildId ? `to guild ${guildId} (dev)` : 'globally'}...`);
+  const modeLabel = isProd ? 'prod' : (guildId ? 'dev' : 'global');
+  console.log(`Registering commands ${guildId ? `to guild ${guildId} (${modeLabel})` : 'globally'}...`);
 
   const res = await fetch(endpoint, {
     method: 'PUT',
