@@ -3,7 +3,10 @@ main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
 [vars]
-# Non-secret config goes here
+# Non-secret config
+OAUTH_ENCRYPTION_KEY = "13850e148b18fa74d957b1d907124aba223b6a8cf965db5bd5449a9cfbc73f5d"
+# Set to your worker URL so "Connect your account" links work (e.g. https://groupthink.xxx.workers.dev)
+PUBLIC_URL = "https://groupthink.carrus-justin.workers.dev"
 
 # Secrets (set via `wrangler secret put`):
 # - DISCORD_PUBLIC_KEY

@@ -1,11 +1,11 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
-    "module": "ES2022",
+    "target": "ESNEXT",
+    "module": "ESNEXT",
     "moduleResolution": "bundler",
     "strict": true,
     "skipLibCheck": true,
-    "lib": ["ES2022"],
+    "lib": ["ESNEXT"],
     "types": ["@cloudflare/workers-types"],
     "noEmit": true,
     "allowSyntheticDefaultImports": true,

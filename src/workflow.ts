@@ -1,24 +1,51 @@
 /**
  * Cloudflare Workflow for processing LLM requests durably.
- * 
+ *
  * This runs without timeout limits, handling:
  * - Fetching Discord messages
  * - Calling Claude API
  * - Posting responses back to Discord
  */
-import { WorkflowEntrypoint, WorkflowStep } from 'cloudflare:workers';
-import type { WorkflowEvent } from 'cloudflare:workers';
-import { 
-  sendMessage, sendMessageWithFiles, getAllMessages, deleteOriginalResponse, 
-  getChannel, createChannel, createThread, type DiscordMessage, type DiscordReaction 
-} from './discord';
-import { chat, type Message } from './claude';
+import { WorkflowEntrypoint, WorkflowStep } from "cloudflare:workers";
+import type { WorkflowEvent } from "cloudflare:workers";
+import {
+  sendMessage,
+  sendMessageWithFiles,
+  getAllMessages,
+  deleteOriginalResponse,
+  editOriginalResponse,
+  getOriginalResponse,
+  getChannel,
+  createChannel,
+  createThread,
+  fetchPlainTextAttachment,
+  isPlainTextAttachment,
+  type DiscordMessage,
+} from "./discord";
+import {
+  chat,
+  chatStream,
+  withCaching,
+  type AnthropicTool,
+  type Message,
+  type ModelTier,
+} from "./claude";
+import {
+  fetchAllMcpTools,
+  mcpCallTool,
+  getMcpConfigFromMessages,
+  resolveMcpServersWithOAuth,
+} from "./mcp";
 
 // ============================================================================
 // Workflow Parameters
 // ============================================================================
 
-export type JobType = 'chat' | 'summarize' | 'post-to-channel' | 'branch-with-summary';
+export type JobType =
+  | "chat"
+  | "summarize"
+  | "post-to-channel"
+  | "branch-with-summary";
 
 interface BaseParams {
   type: JobType;
@@ -28,34 +55,38 @@ interface BaseParams {
 }
 
 interface ChatParams extends BaseParams {
-  type: 'chat';
+  type: "chat";
   isThread: boolean;
+  instruction?: string;
+  invokingUsername?: string;
 }
 
 interface SummarizeParams extends BaseParams {
-  type: 'summarize';
+  type: "summarize";
 }
 
 interface PostToChannelParams extends BaseParams {
-  type: 'post-to-channel';
+  type: "post-to-channel";
 }
 
 interface BranchWithSummaryParams extends BaseParams {
-  type: 'branch-with-summary';
+  type: "branch-with-summary";
   isThread: boolean;
   guildId: string;
 }
 
-export type WorkflowParams = ChatParams | SummarizeParams | PostToChannelParams | BranchWithSummaryParams;
-
-// ============================================================================
-// Environment (secrets available to workflow)
-// ============================================================================
+export type WorkflowParams =
+  | ChatParams
+  | SummarizeParams
+  | PostToChannelParams
+  | BranchWithSummaryParams;
 
 export interface WorkflowEnv {
   DISCORD_TOKEN: string;
   DISCORD_APP_ID: string;
   ANTHROPIC_API_KEY: string;
+  PUBLIC_URL: string;
+  OAUTH_ENCRYPTION_KEY?: string;
 }
 
 // ============================================================================
@@ -63,53 +94,105 @@ export interface WorkflowEnv {
 // ============================================================================
 
 const MAX_MESSAGE_LENGTH = 2000;
-const SUMMARY_MARKER = '--- Summary so far ---';
-const MAX_CONTEXT_TOKENS = 200000;
+const SUMMARY_MARKER = "--- Summary so far ---";
+const RETRY_OPTS = {
+  retries: {
+    limit: 2,
+    delay: "5 seconds" as const,
+    backoff: "linear" as const,
+  },
+};
 
-// Claude Sonnet 4.5 pricing (per million tokens)
-const INPUT_PRICE_PER_M = 3.00;
-const OUTPUT_PRICE_PER_M = 15.00;
-const CACHE_READ_PRICE_PER_M = 0.30;
-const CACHE_WRITE_PRICE_PER_M = 3.75;
+/** Message boundary: --- separator or blank line. */
+const MESSAGE_BREAK = /\n---\s*\n|\n\n/;
+
+/** Minimum chars before posting an incremental message. */
+const MIN_CHARS = 120;
+/** Minimum ms between Discord posts to avoid rate limits. */
+const MIN_INTERVAL_MS = 4_000;
+
+// Claude 4.5 pricing per million tokens (1h cache TTL).
+const PRICING: Record<
+  ModelTier,
+  { in: number; out: number; cacheRead: number; cacheWrite: number }
+> = {
+  haiku: { in: 1.0, out: 5.0, cacheRead: 0.1, cacheWrite: 2.0 },
+  sonnet: { in: 3.0, out: 15.0, cacheRead: 0.3, cacheWrite: 6.0 },
+  opus: { in: 5.0, out: 25.0, cacheRead: 0.5, cacheWrite: 10.0 },
+};
 
 // ============================================================================
-// Utility Functions
+// Helpers
 // ============================================================================
 
-const formatUsageInfo = (usage: Record<string, unknown>): string => {
+/** Run a step durably: serialize to JSON for Cloudflare Workflow checkpointing. */
+async function durable<T>(
+  step: WorkflowStep,
+  name: string,
+  fn: () => Promise<T>,
+  config?: object
+): Promise<T> {
+  const run = async () => JSON.stringify(await fn());
+  const json = config
+    ? await step.do(name, config as any, run)
+    : await step.do(name, run);
+  return JSON.parse(json);
+}
+
+const formatUsageInfo = (
+  usage: Record<string, unknown>,
+  modelTier: ModelTier = "sonnet"
+): string => {
   const inputTokens = (usage.input_tokens as number) || 0;
   const outputTokens = (usage.output_tokens as number) || 0;
-  const cacheCreationTokens = (usage.cache_creation_input_tokens as number) || 0;
+  const cacheCreationTokens =
+    (usage.cache_creation_input_tokens as number) || 0;
   const cacheReadTokens = (usage.cache_read_input_tokens as number) || 0;
-  
-  // Calculate costs
-  const inputCost = (inputTokens / 1_000_000) * INPUT_PRICE_PER_M;
-  const outputCost = (outputTokens / 1_000_000) * OUTPUT_PRICE_PER_M;
-  const cacheReadCost = (cacheReadTokens / 1_000_000) * CACHE_READ_PRICE_PER_M;
-  const cacheWriteCost = (cacheCreationTokens / 1_000_000) * CACHE_WRITE_PRICE_PER_M;
-  const totalCost = inputCost + outputCost + cacheReadCost + cacheWriteCost;
-  
-  // Context remaining
-  const totalUsed = inputTokens + outputTokens;
-  const remaining = MAX_CONTEXT_TOKENS - totalUsed;
-  const percentUsed = ((totalUsed / MAX_CONTEXT_TOKENS) * 100).toFixed(1);
-  
-  // Build info string
-  const parts: string[] = [];
-  parts.push(`${remaining.toLocaleString()} tokens remaining (${percentUsed}% used)`);
-  parts.push(`in: ${inputTokens.toLocaleString()}, out: ${outputTokens.toLocaleString()}`);
-  
+  const p = PRICING[modelTier];
+  const totalCost =
+    (inputTokens / 1_000_000) * p.in +
+    (outputTokens / 1_000_000) * p.out +
+    (cacheReadTokens / 1_000_000) * p.cacheRead +
+    (cacheCreationTokens / 1_000_000) * p.cacheWrite;
+  const totalTokens =
+    inputTokens + outputTokens + cacheReadTokens + cacheCreationTokens;
+  const parts: string[] = [
+    `model: ${modelTier}`,
+    `total: ${totalTokens.toLocaleString()} tokens`,
+    `in: ${inputTokens.toLocaleString()}, out: ${outputTokens.toLocaleString()}`,
+  ];
   if (cacheReadTokens > 0 || cacheCreationTokens > 0) {
-    parts.push(`cache: ${cacheReadTokens.toLocaleString()} read, ${cacheCreationTokens.toLocaleString()} write`);
+    parts.push(
+      `cache: ${cacheReadTokens.toLocaleString()} read, ${cacheCreationTokens.toLocaleString()} write`
+    );
   }
-  
   parts.push(`$${totalCost.toFixed(4)}`);
-  
-  return `-# (${parts.join(' · ')})`;
+  return `-# ${parts.join(" · ")}`;
 };
 
 const isSummaryMarker = (msg: DiscordMessage): boolean =>
   !!msg.author.bot && !!msg.content?.startsWith(SUMMARY_MARKER);
+
+const MODEL_SET_PATTERN = /^-# model:\s*(haiku|sonnet|opus)\s*$/i;
+
+function getModelFromMessages(messages: DiscordMessage[]): ModelTier {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i].content?.trim().match(MODEL_SET_PATTERN);
+    if (messages[i].author.bot && m) return m[1].toLowerCase() as ModelTier;
+  }
+  return "sonnet";
+}
+
+/** Send text to a channel, splitting at natural boundaries if too long. */
+async function sendLongMessage(
+  channelId: string,
+  text: string,
+  token: string
+): Promise<void> {
+  for (const part of splitLongMessage(text)) {
+    await sendMessage(channelId, part, token);
+  }
+}
 
 // ============================================================================
 // Response Parsing (artifacts and message breaks)
@@ -125,35 +208,24 @@ interface ParsedResponse {
   artifacts: Artifact[];
 }
 
-/** Parse LLM response for artifacts and message breaks */
+/** Parse LLM response: extract file attachments, split on --- or blank lines. */
 function parseResponse(text: string): ParsedResponse {
   const artifacts: Artifact[] = [];
-  
-  console.log(`Parsing response of length ${text.length}`);
-  
-  // Extract XML-style file attachments
-  const artifactRegex = /<groupthink:file-attachment\s+name="([^"]+)">([\s\S]*?)<\/groupthink:file-attachment>/g;
-  let cleanedText = text.replace(artifactRegex, (_, filename, content) => {
-    console.log(`Found artifact: ${filename} (${content.length} chars)`);
-    artifacts.push({ name: filename.trim(), content: content.trim() });
-    return ''; // Remove artifact from main text
-  });
-  
-  console.log(`Found ${artifacts.length} artifacts`);
-  
-  // Split by message breaks
+  const artifactRegex =
+    /<groupthink:file-attachment\s+name="([^"]+)">([\s\S]*?)<\/groupthink:file-attachment>/g;
+  const cleanedText = text
+    .replace(artifactRegex, (_, filename, content) => {
+      artifacts.push({ name: filename.trim(), content: content.trim() });
+      return "";
+    })
+    .replace(/\[From\s+<@\d+>\s+\([^)]*\)\]\s*/g, "");
   const messages = cleanedText
-    .split(/<groupthink:message-break\s*\/?>/)
-    .map(m => m.trim())
-    .filter(m => m.length > 0);
-  
-  console.log(`Split into ${messages.length} message parts`);
-  
-  // If no explicit breaks but text is too long, split smartly
+    .split(MESSAGE_BREAK)
+    .map((m) => m.trim())
+    .filter((m) => m.length > 0);
   if (messages.length === 1 && messages[0].length > MAX_MESSAGE_LENGTH) {
     return { messages: splitLongMessage(messages[0]), artifacts };
   }
-  
   return { messages, artifacts };
 }
 
@@ -161,40 +233,40 @@ function parseResponse(text: string): ParsedResponse {
 function splitLongMessage(text: string, maxLen = MAX_MESSAGE_LENGTH): string[] {
   const chunks: string[] = [];
   let remaining = text;
-  
+
   while (remaining.length > maxLen) {
     // Try to split at paragraph break
-    let splitIndex = remaining.lastIndexOf('\n\n', maxLen);
-    
+    let splitIndex = remaining.lastIndexOf("\n\n", maxLen);
+
     // If no paragraph break, try single newline
     if (splitIndex === -1 || splitIndex < maxLen / 2) {
-      splitIndex = remaining.lastIndexOf('\n', maxLen);
+      splitIndex = remaining.lastIndexOf("\n", maxLen);
     }
-    
+
     // If no newline, try sentence end
     if (splitIndex === -1 || splitIndex < maxLen / 2) {
       const sentenceEnd = remaining.slice(0, maxLen).match(/.*[.!?]\s/);
       splitIndex = sentenceEnd ? sentenceEnd[0].length : -1;
     }
-    
+
     // Last resort: hard cut at space
     if (splitIndex === -1 || splitIndex < maxLen / 2) {
-      splitIndex = remaining.lastIndexOf(' ', maxLen);
+      splitIndex = remaining.lastIndexOf(" ", maxLen);
     }
-    
+
     // Absolute last resort: hard cut
     if (splitIndex === -1) {
       splitIndex = maxLen;
     }
-    
+
     chunks.push(remaining.slice(0, splitIndex).trim());
     remaining = remaining.slice(splitIndex).trim();
   }
-  
+
   if (remaining.length > 0) {
     chunks.push(remaining);
   }
-  
+
   return chunks;
 }
 
@@ -203,6 +275,9 @@ function splitLongMessage(text: string, maxLen = MAX_MESSAGE_LENGTH): string[] {
 // ============================================================================
 
 const CHAT_SYSTEM_PROMPT = `You are a helpful assistant in a Discord chat with a group of highly intelligent and knowledgeable individuals.
+
+## What GroupThink is
+You are running inside GroupThink: a Discord bot for collaborative AI conversations. The group shares a channel or thread; someone runs /generate and you get the full conversation as context and reply here. Your reply is posted back to the same channel or thread. The group can later use /summarize to checkpoint the conversation (so future /generate only sees the summary plus new messages), /branch to copy the conversation to a new channel or thread, /branch-with-summary to start a branch with a summarized context, and in threads /post-to-channel to extract insights back to the parent channel. You are one voice in an ongoing discussion—add value, stay on topic, and leave room for others to respond.
 
 ## Guidelines
 - Reference thought leaders when relevant. Your job is to provide a best-in-class response, but also to open the door to further discussion.
@@ -214,25 +289,17 @@ const CHAT_SYSTEM_PROMPT = `You are a helpful assistant in a Discord chat with a
 - Reactions are shown as [Reactions: 👍 x3, ❤️ x2] - these indicate agreement, appreciation, or emphasis.
 - When addressing a user by name, use @username naturally in conversation.
 
-## Discord Formatting (use these!)
-- **bold** for emphasis
-- *italic* for subtle emphasis  
-- __underline__ for important terms
-- ~~strikethrough~~ for corrections
-- \`inline code\` for technical terms
-- \`\`\`language for code blocks\`\`\`
-- > for single-line quotes
-- >>> for multi-line block quotes
-- Bullet points and numbered lists work fine
-
-## DO NOT USE
-- Markdown tables (they don't render in Discord)
-- Headers with # (they don't render)
-- Complex nested formatting
+## Style
+- Write like a chat message, not a document. Favor plain prose and short paragraphs.
+- Use formatting sparingly: at most a little **bold** or \`code\` when it clearly helps. No walls of markdown.
+- Avoid: headers (#), markdown tables, block quotes, long code blocks in the message (use file attachments instead), bullet/list overload.
+- Never use markdown table syntax (pipes | and dashes). The renderer does not support it. Use short bullets or prose; only for tabular data use a code fence with an ASCII table inside.
+- One or two short bullet points is fine; long lists belong in a file attachment.
 
 ## Response Structure
-If your response is long, you can split it into multiple messages using:
-<groupthink:message-break/>
+Prefer short, conversational messages: one main idea per message. A blank line or three dashes on their own line starts a new message:
+---
+That keeps the thread readable and lets the group see your reply as it streams.
 
 For data, code, or structured content that would be better as a file attachment, use XML tags:
 <groupthink:file-attachment name="filename.ext">
@@ -256,187 +323,164 @@ Create a summary that captures:
 
 Be concise but comprehensive. Use bullet points for clarity.`;
 
-const DOCUMENT_SYSTEM_PROMPT = `You are a helpful assistant that extracts critical insights from Discord thread discussions.
+const DOCUMENT_SYSTEM_PROMPT = `Extract critical insights from this thread for the parent channel. Output only bullet points. Maximum compression.
 
-Your task is to identify and summarize:
-1. Key insights and learnings
-2. Important decisions made
-3. Solutions discovered
-4. Any conclusions or recommendations
-
-Format the output as a clear, actionable summary that would be valuable to someone who didn't participate in the thread. Be concise but capture all essential information.`;
+Format:
+- One short line per bullet. No paragraphs. No emojis. No headings.
+- Use simple clauses. Omit needless words (Strunk). If you can say it in 5 words, don't use 10.
+- Group by idea when natural (e.g. "Key constraint: X" then "Artists: A, B, C" as separate bullets).
+- Include: decisions, solutions, recommendations, names/key terms, next steps. Nothing else.
+- Target: a reader who wasn't there gets the gist in under 15 bullets.`;
 
 // ============================================================================
 // Context Collection
 // ============================================================================
 
-async function getChannelContext(channelId: string, token: string): Promise<DiscordMessage[]> {
-  const messages = await getAllMessages(channelId, token);
-  console.log(`getAllMessages returned ${messages.length} messages`);
-  
-  const chronological = messages.reverse();
-  
-  // Find the most recent summary marker and INCLUDE it (it contains important context)
+async function getChannelContext(
+  channelId: string,
+  token: string
+): Promise<DiscordMessage[]> {
+  const chronological = (await getAllMessages(channelId, token)).reverse();
   let startIndex = 0;
   for (let i = chronological.length - 1; i >= 0; i--) {
     if (isSummaryMarker(chronological[i])) {
-      console.log(`Found summary marker at index ${i}, including it and everything after`);
-      startIndex = i;  // Include the summary itself
+      startIndex = i;
       break;
     }
   }
-  
-  const result = chronological.slice(startIndex);
-  console.log(`Returning ${result.length} messages after filtering`);
-  return result;
+  return chronological.slice(startIndex);
 }
 
-async function getThreadContext(threadId: string, token: string): Promise<DiscordMessage[]> {
+async function getThreadContext(
+  threadId: string,
+  token: string
+): Promise<DiscordMessage[]> {
   const threadInfo = await getChannel(threadId, token);
-  const parentChannelId = threadInfo.parent_id;
-  
-  if (!parentChannelId) {
-    const threadMessages = await getAllMessages(threadId, token);
-    return threadMessages.reverse();
+  if (!threadInfo.parent_id) {
+    return (await getAllMessages(threadId, token)).reverse();
   }
-  
   const [channelMessages, threadMessages] = await Promise.all([
-    getChannelContext(parentChannelId, token),
+    getChannelContext(threadInfo.parent_id, token),
     getAllMessages(threadId, token),
   ]);
-  
   return [...channelMessages, ...threadMessages.reverse()];
 }
+
+/** Fetch context: thread (parent + thread) or channel. */
+const fetchContext = (channelId: string, isThread: boolean, token: string) =>
+  isThread
+    ? getThreadContext(channelId, token)
+    : getChannelContext(channelId, token);
 
 // ============================================================================
 // Conversation Conversion
 // ============================================================================
 
-type UserMap = Map<string, string>;
+async function discordMessagesToLLMConversation(
+  messages: DiscordMessage[]
+): Promise<Message[]> {
+  const lastSummaryMarkerIndex = messages.findLastIndex(isSummaryMarker);
 
-/** Format reactions for display */
-function formatReactions(reactions?: DiscordReaction[]): string {
-  if (!reactions || reactions.length === 0) return '';
-  const parts = reactions.map(r => `${r.emoji.name} x${r.count}`);
-  return `\n[Reactions: ${parts.join(', ')}]`;
+  const conversation = await Promise.all(
+    messages
+      .slice(Math.max(0, lastSummaryMarkerIndex))
+      // Remove empty messages
+      .filter((m) => m.content?.trim())
+      // Remove bot metadata (token usage, model setting, MCP config, etc.)
+      .filter((m) => !m.content?.trim().startsWith("-#"))
+      .map(async (m): Promise<Message> => {
+        return {
+          role: m.author.bot ? "assistant" : "user",
+          content: await Promise.all([
+            {
+              // Prepend the author's username to the content
+              type: "text" as const,
+              text: `[From <@${m.author.id}> (${m.author.username})]`,
+            },
+            {
+              // Include the text content
+              type: "text" as const,
+              text: m.content,
+            },
+            // Include text attachments
+            ...(m.attachments
+              ?.filter((a) => isPlainTextAttachment(a))
+              .map(async (a) => ({
+                type: "text" as const,
+                text: await fetchPlainTextAttachment(a.url),
+              })) ?? []),
+            // Include image attachments
+            ...(m.attachments
+              ?.filter((a) => a.content_type?.startsWith("image/jp")) // currently only JPEG is supported
+              .map(async (a) => ({
+                type: "image" as const,
+                source: {
+                  type: "base64" as const,
+                  media_type: "image/jpeg" as const,
+                  data: Buffer.from(
+                    (await fetch(a.url).then((r) =>
+                      r.arrayBuffer()
+                    )) as ArrayBuffer
+                  ).toString("base64"),
+                },
+              })) ?? []),
+            // Add emoji reactions at notes
+            ...(m.reactions?.map((r) => ({
+              type: "text" as const,
+              text: `${r.emoji.name} x${r.count}`,
+            })) ?? []),
+          ]),
+        };
+      })
+  );
+
+  if (conversation.at(-1)?.role === "assistant") {
+    conversation.push({
+      role: "user",
+      content: "[System]: Please continue the conversation.",
+    });
+  }
+  return conversation;
 }
-
-function toConversation(
-  messages: DiscordMessage[], 
-  botUsername = 'GroupThink'
-): { conversation: Message[]; userMap: UserMap } {
-  const conversation: Message[] = [];
-  const userMap: UserMap = new Map();
-  
-  for (const msg of messages) {
-    if (!msg.content?.trim()) continue;
-    
-    // Include summary markers as system context (user role so Claude sees it)
-    if (isSummaryMarker(msg)) {
-      conversation.push({ 
-        role: 'user', 
-        content: `[Previous conversation summary]:\n${msg.content}` 
-      });
-      continue;
-    }
-    
-    const parsed = parseMessageRole(msg, botUsername);
-    if (!parsed) continue;
-    
-    const { role, content, userId, username } = parsed;
-    
-    // Add reactions to the content if present
-    const contentWithReactions = content + formatReactions(msg.reactions);
-    
-    if (userId) userMap.set(userId, userId);
-    if (username) userMap.set(username.toLowerCase(), msg.author.id);
-    
-    const last = conversation[conversation.length - 1];
-    if (last?.role === role) {
-      last.content += '\n' + contentWithReactions;
-    } else {
-      conversation.push({ role, content: contentWithReactions });
-    }
-  }
-  
-  while (conversation.length > 0 && conversation[0].role !== 'user') {
-    conversation.shift();
-  }
-  
-  if (conversation.length > 0 && conversation[conversation.length - 1].role === 'assistant') {
-    conversation.push({ role: 'user', content: '[System]: Please continue the conversation.' });
-  }
-  
-  return { conversation, userMap };
-}
-
-function parseMessageRole(
-  msg: DiscordMessage, 
-  botUsername: string
-): { role: 'user' | 'assistant'; content: string; userId?: string; username?: string } | null {
-  const content = msg.content;
-  
-  if (!content?.trim()) return null;
-  
-  if (content.startsWith('-# (') && (content.includes('tokens') || content.includes('remaining'))) {
-    return null;
-  }
-  
-  const userMentionMatch = content.match(/^<@(\d+)>:\s*([\s\S]*)$/);
-  if (msg.author.bot && userMentionMatch) {
-    return { role: 'user', content: userMentionMatch[2], userId: userMentionMatch[1] };
-  }
-  
-  if (msg.author.bot && msg.author.username === botUsername) {
-    return { role: 'assistant', content };
-  }
-  
-  if (msg.author.bot) {
-    return { role: 'user', content: `[${msg.author.username}]: ${content}` };
-  }
-  
-  return { 
-    role: 'user', 
-    content: `[${msg.author.username}]: ${content}`,
-    username: msg.author.username 
-  };
-}
-
-const convertMentions = (text: string, userMap: UserMap): string =>
-  text.replace(/@(\w+)/g, (match, username) => {
-    const userId = userMap.get(username.toLowerCase());
-    return userId ? `<@${userId}>` : match;
-  });
 
 // ============================================================================
 // The Workflow
 // ============================================================================
 
-export class GroupThinkWorkflow extends WorkflowEntrypoint<WorkflowEnv, WorkflowParams> {
+export class GroupThinkWorkflow extends WorkflowEntrypoint<
+  WorkflowEnv,
+  WorkflowParams
+> {
   async run(event: WorkflowEvent<WorkflowParams>, step: WorkflowStep) {
     const params = event.payload;
-    console.log(`Starting workflow: ${params.type} for channel ${params.channelId}`);
+    console.log(
+      `Starting workflow: ${params.type} for channel ${params.channelId}`
+    );
 
     try {
       switch (params.type) {
-        case 'chat':
+        case "chat":
           await this.processChat(params, step);
           break;
-        case 'summarize':
+        case "summarize":
           await this.processSummarize(params, step);
           break;
-        case 'post-to-channel':
+        case "post-to-channel":
           await this.processPostToChannel(params, step);
           break;
-        case 'branch-with-summary':
+        case "branch-with-summary":
           await this.processBranchWithSummary(params, step);
           break;
       }
     } catch (err) {
-      console.error('Workflow error:', err);
+      console.error("Workflow error:", err);
       // Try to send error message
-      await step.do('send-error', async () => {
-        await sendMessage(params.channelId, `❌ Error: ${err}`, this.env.DISCORD_TOKEN);
+      await step.do("send-error", async () => {
+        await sendMessage(
+          params.channelId,
+          `❌ Error: ${err}`,
+          this.env.DISCORD_TOKEN
+        );
         await deleteOriginalResponse(params.appId, params.interactionToken);
       });
       throw err;
@@ -444,281 +488,429 @@ export class GroupThinkWorkflow extends WorkflowEntrypoint<WorkflowEnv, Workflow
   }
 
   private async processChat(params: ChatParams, step: WorkflowStep) {
-    // Step 1: Fetch messages (serialize for durability)
-    const messagesJson = await step.do('fetch-messages', async () => {
-      const msgs = params.isThread
-        ? await getThreadContext(params.channelId, this.env.DISCORD_TOKEN)
-        : await getChannelContext(params.channelId, this.env.DISCORD_TOKEN);
-      return JSON.stringify(msgs);
-    });
+    const t0 = Date.now();
+    const elapsed = (label: string) =>
+      console.log(`[chat] +${Date.now() - t0}ms ${label}`);
 
-    const messages: DiscordMessage[] = JSON.parse(messagesJson);
-    console.log(`Fetched ${messages.length} messages`);
+    const messages = await durable(step, "fetch-messages", () =>
+      fetchContext(params.channelId, params.isThread, this.env.DISCORD_TOKEN)
+    );
+    elapsed(`fetched ${messages.length} messages`);
 
-    // Step 2: Convert to conversation
-    const { conversation, userMap } = toConversation(messages);
-    
-    if (conversation.length === 0) {
-      await step.do('send-empty-response', async () => {
-        await sendMessage(params.channelId, 'No conversation history found.', this.env.DISCORD_TOKEN);
-        await deleteOriginalResponse(params.appId, params.interactionToken);
+    const mcpServers = await resolveMcpServersWithOAuth(
+      messages,
+      getMcpConfigFromMessages(messages),
+      this.env,
+      params.channelId
+    );
+    elapsed(`resolved ${mcpServers.length} MCP servers`);
+
+    const modelTier = getModelFromMessages(messages);
+    // Apply cache breakpoints to the real Discord messages BEFORE
+    // appending any ephemeral instruction, so breakpoints are stable
+    // across calls.
+    const conversation = withCaching(
+      await discordMessagesToLLMConversation(messages),
+    );
+    elapsed(`built conversation (${conversation.length} turns)`);
+
+    if (params.instruction?.trim()) {
+      conversation.push({
+        role: "user",
+        content: `[Instruction]: ${params.instruction.trim()}`,
       });
-      return;
+    }
+    if (params.instruction && params.invokingUsername) {
+      await step.do("post-instruction-message", async () => {
+        await sendMessage(
+          params.channelId,
+          params.invokingUsername + " just asked: " + params.instruction,
+          this.env.DISCORD_TOKEN
+        );
+      });
     }
 
-    // Step 3: Call Claude (serialize for durability)
-    const responseJson = await step.do('call-claude', {
-      retries: { limit: 2, delay: '5 seconds', backoff: 'linear' }
-    }, async () => {
-      const { text, usage } = await chat(conversation, this.env.ANTHROPIC_API_KEY, CHAT_SYSTEM_PROMPT);
-      return JSON.stringify({ text, usage, userMap: Object.fromEntries(userMap) });
+    // Prepare MCP tools (if any)
+    let mcpTools: AnthropicTool[] = [];
+    let resolveTool:
+      | ((name: string, input: Record<string, unknown>) => Promise<string>)
+      | undefined;
+    let onToolCall: ((name: string) => Promise<void>) | undefined;
+
+    if (mcpServers.length > 0) {
+      try {
+        const { tools, sessions, oauthRequired } =
+          await fetchAllMcpTools(mcpServers);
+        elapsed(`fetched ${tools.length} MCP tools`);
+        if (oauthRequired?.length)
+          await this.sendOAuthPrompts(oauthRequired, params.channelId);
+        if (tools.length > 0) {
+          mcpTools = tools.map((t) => ({
+            name: t.name,
+            description: t.description ?? "",
+            input_schema: t.inputSchema,
+          }));
+          resolveTool = async (name, input) => {
+            const t = tools.find((x) => x.name === name);
+            if (!t) return "Unknown tool";
+            const s = mcpServers[t.serverIndex];
+            return mcpCallTool(
+              s.url,
+              s.auth,
+              name,
+              input,
+              sessions[t.serverIndex]
+            );
+          };
+          onToolCall = async (name) => {
+            await sendMessage(
+              params.channelId,
+              `_Calling ${name.replace(/_/g, " ")}_`,
+              this.env.DISCORD_TOKEN
+            );
+          };
+        }
+      } catch (e) {
+        console.error("MCP setup failed:", e);
+      }
+    }
+
+    // Stream response (with incremental message delivery + optional tools)
+    const responseJson = await step.do("call-claude", RETRY_OPTS, async () => {
+      await editOriginalResponse(
+        params.appId,
+        params.interactionToken,
+        "Thinking...",
+        this.env.DISCORD_TOKEN
+      );
+      elapsed("posted thinking indicator");
+
+      let firstToken = false;
+      let sentUpTo = 0; // chars of the response already posted
+      let lastPostTime = 0;
+      const controller = new AbortController();
+
+      const { text, usage } = await chatStream(
+        conversation,
+        this.env.ANTHROPIC_API_KEY,
+        CHAT_SYSTEM_PROMPT,
+        {
+          modelTier,
+          tools: mcpTools.length > 0 ? mcpTools : undefined,
+          resolveTool,
+          onToolCall,
+          signal: controller.signal,
+          onUpdate: async (accumulated) => {
+            if (!firstToken) {
+              firstToken = true;
+              elapsed("first token");
+            }
+            // Find the furthest break point that gives us >= MIN_CHARS
+            let candidateEnd = sentUpTo;
+            const rest = accumulated.slice(sentUpTo);
+            let searchFrom = 0;
+            while (true) {
+              const m = rest.slice(searchFrom).match(MESSAGE_BREAK);
+              if (!m) break;
+              candidateEnd = sentUpTo + searchFrom + m.index! + m[0].length;
+              searchFrom += m.index! + m[0].length;
+            }
+            if (candidateEnd <= sentUpTo) return; // no break found
+            const part = accumulated
+              .slice(sentUpTo, candidateEnd)
+              .trim()
+              .replace(/\[From\s+<@\d+>\s+\([^)]*\)\]\s*/g, "");
+            if (part.length < MIN_CHARS) return; // not enough text yet
+            if (Date.now() - lastPostTime < MIN_INTERVAL_MS) return;
+            if (part.length > 0) {
+              const original = await getOriginalResponse(
+                params.appId,
+                params.interactionToken,
+                this.env.DISCORD_TOKEN
+              );
+              if (original === null) {
+                controller.abort();
+                return;
+              }
+              await sendMessage(params.channelId, part, this.env.DISCORD_TOKEN);
+              lastPostTime = Date.now();
+              elapsed(`sent incremental (${part.length} chars)`);
+            }
+            sentUpTo = candidateEnd;
+          },
+        }
+      );
+      elapsed(`stream complete (sentUpTo=${sentUpTo}/${text.length})`);
+
+      return JSON.stringify({
+        text,
+        usage,
+        sentUpTo,
+        lastPostTime,
+        modelTier,
+        aborted: controller.signal.aborted,
+      });
     });
 
-    // Step 4: Post response to Discord
-    await step.do('post-response', async () => {
-      const { text, usage, userMap: userMapObj } = JSON.parse(responseJson) as { 
-        text: string; 
-        usage: Record<string, number>; 
-        userMap: Record<string, string> 
+    await step.do("post-response", async () => {
+      const parsed = JSON.parse(responseJson) as {
+        text: string;
+        usage: Record<string, number>;
+        sentUpTo?: number;
+        lastPostTime?: number;
+        modelTier?: ModelTier;
+        aborted?: boolean;
       };
-      const userMapRestored = new Map(Object.entries(userMapObj));
-      const tokenInfo = formatUsageInfo(usage);
-      
-      // Parse response for artifacts and message breaks
-      const { messages: msgParts, artifacts } = parseResponse(text);
-      
-      // Send each message part
-      for (let i = 0; i < msgParts.length; i++) {
-        const part = convertMentions(msgParts[i], userMapRestored);
-        
-        // Attach artifacts to the last message
-        if (i === msgParts.length - 1 && artifacts.length > 0) {
-          await sendMessageWithFiles(params.channelId, part, artifacts, this.env.DISCORD_TOKEN);
+      if (parsed.aborted) return;
+      const {
+        text,
+        usage,
+        sentUpTo = 0,
+        lastPostTime: prevPostTime = 0,
+        modelTier: tier = "sonnet",
+      } = parsed;
+
+      console.log(`[chat] full response (${text.length} chars):\n${text}`);
+
+      // Parse only the remainder we haven't sent yet
+      const remainder = text.slice(sentUpTo);
+      const { messages: msgParts, artifacts } = parseResponse(remainder);
+      console.log(
+        `[chat] post-response: ${msgParts.length} parts, ${artifacts.length} artifacts from ${remainder.length} remaining chars`,
+      );
+
+      let lastSend = prevPostTime;
+      for (const [i, part] of msgParts.entries()) {
+        // Throttle: wait 4s between posts (skip for last part)
+        const isLast = i === msgParts.length - 1;
+        const sinceLast = Date.now() - lastSend;
+        if (!isLast && lastSend > 0 && sinceLast < MIN_INTERVAL_MS) {
+          await new Promise((r) =>
+            setTimeout(r, MIN_INTERVAL_MS - sinceLast),
+          );
+        }
+        console.log(
+          `[chat] posting part ${i + 1}/${msgParts.length} (${part.length} chars): ${JSON.stringify(part.slice(0, 100))}`,
+        );
+        if (isLast && artifacts.length > 0) {
+          await sendMessageWithFiles(
+            params.channelId,
+            part,
+            artifacts,
+            this.env.DISCORD_TOKEN,
+          );
         } else {
           await sendMessage(params.channelId, part, this.env.DISCORD_TOKEN);
         }
+        lastSend = Date.now();
       }
-      
-      // Send token info
-      await sendMessage(params.channelId, tokenInfo, this.env.DISCORD_TOKEN);
+      // Throttle before usage message too
+      const sinceLast = Date.now() - lastSend;
+      if (lastSend > 0 && sinceLast < MIN_INTERVAL_MS) {
+        await new Promise((r) =>
+          setTimeout(r, MIN_INTERVAL_MS - sinceLast),
+        );
+      }
+      await sendMessage(
+        params.channelId,
+        formatUsageInfo(usage, tier),
+        this.env.DISCORD_TOKEN,
+      );
       await deleteOriginalResponse(params.appId, params.interactionToken);
     });
+    elapsed("done");
+  }
 
-    console.log('Chat workflow completed');
+  private async sendOAuthPrompts(oauthRequired: string[], channelId: string) {
+    if (!this.env.PUBLIC_URL) {
+      await sendMessage(
+        channelId,
+        "OAuth is required for this MCP server, but PUBLIC_URL is not configured.",
+        this.env.DISCORD_TOKEN
+      );
+      return;
+    }
+    for (const url of oauthRequired) {
+      const name = (() => {
+        try {
+          return new URL(url).hostname.replace(/^mcp\./, "");
+        } catch {
+          return "this server";
+        }
+      })();
+      const link = `${this.env.PUBLIC_URL}/oauth/start?channel_id=${channelId}&mcp_url=${encodeURIComponent(url)}`;
+      await sendMessage(
+        channelId,
+        `${name} requires OAuth. [Connect your account](${link})`,
+        this.env.DISCORD_TOKEN
+      );
+    }
   }
 
   private async processSummarize(params: SummarizeParams, step: WorkflowStep) {
-    // Step 1: Fetch messages (serialize for durability)
-    const messagesJson = await step.do('fetch-messages', async () => {
-      const msgs = await getChannelContext(params.channelId, this.env.DISCORD_TOKEN);
-      return JSON.stringify(msgs);
-    });
+    const messages = await durable(step, "fetch-messages", () =>
+      getChannelContext(params.channelId, this.env.DISCORD_TOKEN)
+    );
+    const { text, usage } = await durable(
+      step,
+      "call-claude",
+      async () => {
+        const conversation = await discordMessagesToLLMConversation(messages);
+        conversation.push({
+          role: "user",
+          content: "Please summarize the previous conversation.",
+        });
+        return chat(
+          conversation,
+          this.env.ANTHROPIC_API_KEY,
+          SUMMARIZE_SYSTEM_PROMPT
+        );
+      },
+      RETRY_OPTS
+    );
 
-    const messages: DiscordMessage[] = JSON.parse(messagesJson);
-    const { conversation } = toConversation(messages);
-    
-    if (conversation.length === 0) {
-      await step.do('send-empty-response', async () => {
-        await sendMessage(params.channelId, 'No conversation to summarize.', this.env.DISCORD_TOKEN);
-        await deleteOriginalResponse(params.appId, params.interactionToken);
-      });
-      return;
-    }
-
-    // Step 2: Call Claude to summarize (serialize for durability)
-    const responseJson = await step.do('call-claude', {
-      retries: { limit: 2, delay: '5 seconds', backoff: 'linear' }
-    }, async () => {
-      const summaryPrompt: Message[] = [
-        { 
-          role: 'user', 
-          content: `Please summarize the following conversation:\n\n${conversation.map(m => `${m.role}: ${m.content}`).join('\n\n')}`
-        }
-      ];
-      const result = await chat(summaryPrompt, this.env.ANTHROPIC_API_KEY, SUMMARIZE_SYSTEM_PROMPT);
-      return JSON.stringify(result);
-    });
-
-    // Step 3: Post summary (use smart splitting for long summaries)
-    await step.do('post-response', async () => {
-      const { text, usage } = JSON.parse(responseJson) as { text: string; usage: Record<string, number> };
-      const summaryMessage = `${SUMMARY_MARKER}\n${text}`;
-      const tokenInfo = formatUsageInfo(usage);
-      
-      // Split if too long
-      const parts = splitLongMessage(summaryMessage);
-      for (const part of parts) {
-        await sendMessage(params.channelId, part, this.env.DISCORD_TOKEN);
-      }
-      
-      await sendMessage(params.channelId, tokenInfo, this.env.DISCORD_TOKEN);
+    await step.do("post-response", async () => {
+      await sendLongMessage(
+        params.channelId,
+        `${SUMMARY_MARKER}\n${text}`,
+        this.env.DISCORD_TOKEN
+      );
+      await sendMessage(
+        params.channelId,
+        formatUsageInfo(usage),
+        this.env.DISCORD_TOKEN
+      );
       await deleteOriginalResponse(params.appId, params.interactionToken);
     });
-
-    console.log('Summarize workflow completed');
   }
 
-  private async processPostToChannel(params: PostToChannelParams, step: WorkflowStep) {
-    // Step 1: Get thread info (serialize for durability)
-    const threadInfoJson = await step.do('get-thread-info', async () => {
-      const info = await getChannel(params.channelId, this.env.DISCORD_TOKEN);
-      return JSON.stringify(info);
-    });
-
-    const threadInfo = JSON.parse(threadInfoJson) as { parent_id?: string; name?: string };
-    const parentChannelId = threadInfo.parent_id;
-    
-    if (!parentChannelId) {
-      await step.do('send-error-response', async () => {
-        await sendMessage(params.channelId, 'Could not find parent channel.', this.env.DISCORD_TOKEN);
+  private async processPostToChannel(
+    params: PostToChannelParams,
+    step: WorkflowStep
+  ) {
+    const threadInfo = await durable(step, "get-thread-info", () =>
+      getChannel(params.channelId, this.env.DISCORD_TOKEN)
+    );
+    if (!threadInfo.parent_id) {
+      await step.do("send-error-response", async () => {
+        await sendMessage(
+          params.channelId,
+          "Could not find parent channel.",
+          this.env.DISCORD_TOKEN
+        );
         await deleteOriginalResponse(params.appId, params.interactionToken);
       });
       return;
     }
+    const messages = await durable(step, "fetch-messages", async () =>
+      (await getAllMessages(params.channelId, this.env.DISCORD_TOKEN)).reverse()
+    );
+    const { text } = await durable(
+      step,
+      "call-claude",
+      async () => {
+        const conversation = await discordMessagesToLLMConversation(messages);
+        conversation.push({
+          role: "user",
+          content:
+            "Please extract the critical insights from the previous conversation.",
+        });
+        return chat(
+          conversation,
+          this.env.ANTHROPIC_API_KEY,
+          DOCUMENT_SYSTEM_PROMPT
+        );
+      },
+      RETRY_OPTS
+    );
 
-    // Step 2: Fetch thread messages (serialize for durability)
-    const messagesJson = await step.do('fetch-messages', async () => {
-      const threadMessages = await getAllMessages(params.channelId, this.env.DISCORD_TOKEN);
-      return JSON.stringify(threadMessages.reverse());
-    });
-
-    const messages: DiscordMessage[] = JSON.parse(messagesJson);
-    const { conversation } = toConversation(messages);
-    
-    if (conversation.length === 0) {
-      await step.do('send-empty-response', async () => {
-        await sendMessage(params.channelId, 'No conversation to post.', this.env.DISCORD_TOKEN);
-        await deleteOriginalResponse(params.appId, params.interactionToken);
-      });
-      return;
-    }
-
-    // Step 3: Call Claude to extract insights (serialize for durability)
-    const responseJson = await step.do('call-claude', {
-      retries: { limit: 2, delay: '5 seconds', backoff: 'linear' }
-    }, async () => {
-      const documentPrompt: Message[] = [
-        { 
-          role: 'user', 
-          content: `Please extract the critical insights from this thread discussion:\n\n${conversation.map(m => `${m.role}: ${m.content}`).join('\n\n')}`
-        }
-      ];
-      const result = await chat(documentPrompt, this.env.ANTHROPIC_API_KEY, DOCUMENT_SYSTEM_PROMPT);
-      return JSON.stringify(result);
-    });
-
-    // Step 4: Post to parent channel (use smart splitting for long documents)
-    await step.do('post-response', async () => {
-      const { text, usage } = JSON.parse(responseJson) as { text: string; usage: Record<string, number> };
-      const threadName = threadInfo.name || 'thread';
-      const documentMessage = `📋 **Insights from "${threadName}"**\n\n${text}`;
-      const tokenInfo = formatUsageInfo(usage);
-      
-      // Split if too long
-      const parts = splitLongMessage(documentMessage);
-      for (const part of parts) {
-        await sendMessage(parentChannelId, part, this.env.DISCORD_TOKEN);
-      }
-      
-      await sendMessage(parentChannelId, tokenInfo, this.env.DISCORD_TOKEN);
+    await step.do("post-response", async () => {
+      await sendLongMessage(
+        threadInfo.parent_id!,
+        `From "${threadInfo.name || "thread"}":\n${text}`,
+        this.env.DISCORD_TOKEN
+      );
       await deleteOriginalResponse(params.appId, params.interactionToken);
     });
-
-    console.log('Post-to-channel workflow completed');
   }
 
-  private async processBranchWithSummary(params: BranchWithSummaryParams, step: WorkflowStep) {
-    // Step 1: Fetch messages (serialize for durability)
-    const messagesJson = await step.do('fetch-messages', async () => {
-      const msgs = params.isThread
-        ? await getThreadContext(params.channelId, this.env.DISCORD_TOKEN)
-        : await getChannelContext(params.channelId, this.env.DISCORD_TOKEN);
-      return JSON.stringify(msgs);
-    });
+  private async processBranchWithSummary(
+    params: BranchWithSummaryParams,
+    step: WorkflowStep
+  ) {
+    const messages = await durable(step, "fetch-messages", () =>
+      fetchContext(params.channelId, params.isThread, this.env.DISCORD_TOKEN)
+    );
 
-    const messages: DiscordMessage[] = JSON.parse(messagesJson);
-    const { conversation } = toConversation(messages);
-    
-    if (conversation.length === 0) {
-      await step.do('send-empty-response', async () => {
-        await sendMessage(params.channelId, 'No conversation to branch.', this.env.DISCORD_TOKEN);
-        await deleteOriginalResponse(params.appId, params.interactionToken);
-      });
-      return;
-    }
+    const channelInfo = await durable(step, "get-channel-info", () =>
+      getChannel(params.channelId, this.env.DISCORD_TOKEN)
+    );
 
-    // Step 2: Get channel info for naming (serialize for durability)
-    const channelInfoJson = await step.do('get-channel-info', async () => {
-      const info = await getChannel(params.channelId, this.env.DISCORD_TOKEN);
-      return JSON.stringify(info);
-    });
+    const { text, usage } = await durable(
+      step,
+      "call-claude",
+      async () => {
+        const conversation = await discordMessagesToLLMConversation(messages);
+        conversation.push({
+          role: "user",
+          content:
+            "Please create a concise summary that captures all essential context needed to continue the discussion.",
+        });
+        return chat(
+          conversation,
+          this.env.ANTHROPIC_API_KEY,
+          SUMMARIZE_SYSTEM_PROMPT
+        );
+      },
+      RETRY_OPTS
+    );
 
-    const channelInfo = JSON.parse(channelInfoJson) as { parent_id?: string; name?: string };
-
-    // Step 3: Call Claude to summarize (serialize for durability)
-    const responseJson = await step.do('call-claude', {
-      retries: { limit: 2, delay: '5 seconds', backoff: 'linear' }
-    }, async () => {
-      const summaryPrompt: Message[] = [
-        { 
-          role: 'user', 
-          content: `Please create a concise summary of this conversation that captures all essential context needed to continue the discussion:\n\n${conversation.map(m => `${m.role}: ${m.content}`).join('\n\n')}`
-        }
-      ];
-      const result = await chat(summaryPrompt, this.env.ANTHROPIC_API_KEY, SUMMARIZE_SYSTEM_PROMPT);
-      return JSON.stringify(result);
-    });
-
-    // Step 4: Create new channel/thread with summary
-    await step.do('create-branch', async () => {
-      const { text, usage } = JSON.parse(responseJson) as { text: string; usage: Record<string, number> };
+    await step.do("create-branch", async () => {
+      const summaryText = `${SUMMARY_MARKER}\n${text}`;
       const tokenInfo = formatUsageInfo(usage);
-      const summaryMessage = `${SUMMARY_MARKER}\n${text}`;
-      
+      const sourceName = channelInfo.name || "thread";
+
+      let targetId: string;
       if (params.isThread) {
-        // In a thread: create a new thread in the parent channel
-        const parentChannelId = channelInfo.parent_id;
-        
-        if (!parentChannelId) {
-          await sendMessage(params.channelId, 'Could not find parent channel for this thread.', this.env.DISCORD_TOKEN);
+        if (!channelInfo.parent_id) {
+          await sendMessage(
+            params.channelId,
+            "Could not find parent channel for this thread.",
+            this.env.DISCORD_TOKEN
+          );
           await deleteOriginalResponse(params.appId, params.interactionToken);
           return;
         }
-        
-        // Create a starter message for the new thread
-        const starterMsg = await sendMessage(parentChannelId, `**Branch with summary from "${channelInfo.name || 'thread'}"**`, this.env.DISCORD_TOKEN);
-        const newThread = await createThread(parentChannelId, starterMsg.id, `Branch of ${channelInfo.name || 'thread'}`, this.env.DISCORD_TOKEN);
-        
-        // Post summary to new thread
-        const parts = splitLongMessage(summaryMessage);
-        for (const part of parts) {
-          await sendMessage(newThread.id, part, this.env.DISCORD_TOKEN);
-        }
-        await sendMessage(newThread.id, tokenInfo, this.env.DISCORD_TOKEN);
-        
-        await sendMessage(params.channelId, `Created new branch with summary: <#${newThread.id}>`, this.env.DISCORD_TOKEN);
+        const starterMsg = await sendMessage(
+          channelInfo.parent_id,
+          `**Branch with summary from "${sourceName}"**`,
+          this.env.DISCORD_TOKEN
+        );
+        const newThread = await createThread(
+          channelInfo.parent_id,
+          starterMsg.id,
+          `Branch of ${sourceName}`,
+          this.env.DISCORD_TOKEN
+        );
+        targetId = newThread.id;
       } else {
-        // In a channel: create a new channel in the same category
         const newChannel = await createChannel(
           params.guildId,
-          `branch-of-${channelInfo.name || 'channel'}`,
+          `branch-of-${sourceName}`,
           channelInfo.parent_id,
           this.env.DISCORD_TOKEN
         );
-        
-        // Post summary to new channel
-        const parts = splitLongMessage(summaryMessage);
-        for (const part of parts) {
-          await sendMessage(newChannel.id, part, this.env.DISCORD_TOKEN);
-        }
-        await sendMessage(newChannel.id, tokenInfo, this.env.DISCORD_TOKEN);
-        
-        await sendMessage(params.channelId, `Created new branch with summary: <#${newChannel.id}>`, this.env.DISCORD_TOKEN);
+        targetId = newChannel.id;
       }
-      
+
+      await sendLongMessage(targetId, summaryText, this.env.DISCORD_TOKEN);
+      await sendMessage(targetId, tokenInfo, this.env.DISCORD_TOKEN);
+      await sendMessage(
+        params.channelId,
+        `Created new branch with summary: <#${targetId}>`,
+        this.env.DISCORD_TOKEN
+      );
       await deleteOriginalResponse(params.appId, params.interactionToken);
     });
-
-    console.log('Branch-with-summary workflow completed');
   }
 }
